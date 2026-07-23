@@ -1,0 +1,13 @@
+---
+title: "MEBlack Random Forest"
+output: html_notebook
+---
+
+Questions to Answer:\
+\
+
+-   **Does the MEblack–salinity relationship survive exact permutation testing?**
+
+-   **Can salinity predict MEblack better than month, location, conductivity, and a mean-only baseline during leave-one-event-out validation?**
+
+-   **Does an individual biologically relevant MEblack gene reproduce the same environmental pattern?**

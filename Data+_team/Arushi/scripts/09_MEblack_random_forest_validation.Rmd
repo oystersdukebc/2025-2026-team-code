@@ -1,0 +1,2776 @@
+---
+title: "MEblack Random Forest and Predictive Validation"
+output: html_notebook
+---
+
+Questions to Answer:
+
+-   **Does the MEblack–salinity relationship survive exact permutation testing?**
+
+-   **Can salinity predict MEblack better than month, location, conductivity, and a mean-only baseline during leave-one-event-out validation?**
+
+-   **Does an individual biologically relevant MEblack gene reproduce the same environmental pattern?**
+
+# Analysis Overview
+
+This analysis evaluates whether salinity and conductivity can predict the MEblack module eigengene across the six independent location–month collection events.
+
+The analysis uses the completed Sophie-count WGCNA outputs and does not rerun DESeq2, WGCNA, or environmental-data preparation.
+
+The planned analyses include:
+
+1.  Linear-model comparisons
+2.  Leave-one-event-out cross-validation
+3.  Random forest regression
+4.  Exact permutation testing
+5.  Comparison with month, location, and a mean-only baseline
+6.  Exploratory analysis of one individual MEblack gene
+
+```{r}
+# Load packages used for data manipulation, visualization,
+# regression summaries, and functional programming.
+#
+# The random forest package will be loaded later, once we confirm
+# which implementation is available in the DCC environment.
+
+library(tidyverse)
+library(broom)
+```
+
+```{r}
+# Record the current working directory.
+#
+# This notebook should ideally be saved and run from:
+# Data+_team/Arushi/scripts
+
+getwd()
+```
+
+```{r}
+# Locate the completed Sophie-count WGCNA object.
+#
+# This object contains the module assignments, eigengenes,
+# sample metadata, joined environmental data, and WGCNA results.
+
+wgcna_core_file <- find_existing_file(
+  c(
+    "SophieCounts_WGCNA_core_objects.rds",
+    file.path(
+      "SophieCounts_WGCNA",
+      "SophieCounts_WGCNA_core_objects.rds"
+    )
+  )
+)
+
+# Locate the existing variance-stabilized DESeq2 object.
+#
+# This will be used later for the individual-gene analysis.
+
+vst_file <- find_existing_file(
+  c(
+    "SophieCounts_deseq2_vst.rds",
+    file.path(
+      "SophieCounts_WGCNA",
+      "SophieCounts_deseq2_vst.rds"
+    )
+  )
+)
+
+wgcna_core_file
+vst_file
+```
+
+```{r}
+# Load the saved Sophie-count WGCNA objects.
+#
+# We are loading the completed results rather than rerunning
+# the computationally intensive DESeq2 and WGCNA workflows.
+
+core_wgcna_objects_sophie <- readRDS(
+  wgcna_core_file
+)
+
+# Load the existing DESeq2 variance-stabilized transformation.
+#
+# This object will not be used until the individual-gene section,
+# but loading it now confirms that the required file is available.
+
+vst_sophie <- readRDS(
+  vst_file
+)
+```
+
+```{r}
+# Display the names of all objects stored inside the WGCNA list.
+#
+# Expected entries include:
+# - module_colors
+# - sample_metadata
+# - sample_level_eigengenes
+# - event_level_eigengenes
+# - joined_environment
+# - module_trait_results
+
+names(core_wgcna_objects_sophie)
+```
+
+```{r}
+# Summarize the class of each stored object.
+#
+# This helps confirm which components are data frames, matrices,
+# lists, vectors, or other object types.
+
+tibble::tibble(
+  object_name = names(core_wgcna_objects_sophie),
+  object_class = purrr::map_chr(
+    core_wgcna_objects_sophie,
+    ~ paste(class(.x), collapse = ", ")
+  )
+)
+```
+
+```{r}
+# Extract the completed event-level table containing:
+# - module eigengenes
+# - location and month information
+# - environmental measurements
+#
+# This is the same joined table created in the Sophie-count
+# WGCNA workflow. No environmental matrix is rebuilt here.
+
+wgcna_environment_sophie <-
+  core_wgcna_objects_sophie$joined_environment
+```
+
+```{r}
+# Inspect the dimensions and column names of the joined table.
+#
+# The expected number of rows is six because each row represents
+# one independent location–month collection event.
+
+dim(wgcna_environment_sophie)
+names(wgcna_environment_sophie)
+dplyr::glimpse(wgcna_environment_sophie)
+```
+
+```{r}
+# Define the columns required for the primary modeling analysis.
+
+required_model_columns <- c(
+  "event_id",
+  "location",
+  "month",
+  "MEblack",
+  "salinity_7d_spline_mean",
+  "conductivity_7d_spline_mean"
+)
+
+# Identify any required columns that are missing.
+
+missing_model_columns <- setdiff(
+  required_model_columns,
+  names(wgcna_environment_sophie)
+)
+
+missing_model_columns
+```
+
+```{r}
+# Select the exact variables needed for model development.
+#
+# Location and month are converted to factors with explicit
+# reference levels so that model coefficients are consistent.
+
+MEblack_model_data <- wgcna_environment_sophie %>%
+  dplyr::transmute(
+    event_id = as.character(event_id),
+
+    location = factor(
+      location,
+      levels = c("CMT", "DAF")
+    ),
+
+    month = factor(
+      month,
+      levels = c("Jun", "Jul", "Aug")
+    ),
+
+    MEblack = as.numeric(MEblack),
+
+    salinity = as.numeric(
+      salinity_7d_spline_mean
+    ),
+
+    conductivity = as.numeric(
+      conductivity_7d_spline_mean
+    )
+  ) %>%
+  dplyr::arrange(
+    month,
+    location
+  )
+
+MEblack_model_data
+```
+
+```{r}
+# Perform only the minimum checks needed before modeling.
+#
+# These checks confirm that:
+# - there are six rows
+# - every event is unique
+# - the primary variables contain no missing values
+#
+# The full environmental validation was already completed
+# in the previous project notebooks.
+
+MEblack_input_summary <- MEblack_model_data %>%
+  dplyr::summarise(
+    rows = dplyr::n(),
+    unique_events = dplyr::n_distinct(event_id),
+    missing_MEblack = sum(is.na(MEblack)),
+    missing_salinity = sum(is.na(salinity)),
+    missing_conductivity = sum(is.na(conductivity))
+  )
+
+MEblack_input_summary
+```
+
+```{r}
+# Stop if the event-level modeling table does not contain exactly
+# six unique and complete collection events.
+
+stopifnot(
+  nrow(MEblack_model_data) == 6,
+  dplyr::n_distinct(MEblack_model_data$event_id) == 6,
+  !anyNA(
+    MEblack_model_data[
+      c(
+        "MEblack",
+        "salinity",
+        "conductivity"
+      )
+    ]
+  )
+)
+```
+
+# Baseline and Linear Model Comparison
+
+Before fitting the random forest models, we compare several conventional linear models using the complete six-event dataset.
+
+These full-data models describe how well each predictor explains MEblack within the observed events. They are not yet measures of predictive performance because every observation is used to fit each model. Predictive performance will be evaluated separately using leave-one-event-out cross-validation.
+
+```{r}
+# Express conductivity in units of 1,000.
+#
+# Rescaling does not change the model fit, p-value, R-squared,
+# predictions, or biological relationship. It only makes the
+# regression coefficient easier to interpret.
+
+MEblack_model_data <- MEblack_model_data %>%
+  dplyr::mutate(
+    conductivity_per_1000 = conductivity / 1000
+  )
+
+MEblack_model_data
+```
+
+```{r}
+# Define a helper function for calculating corrected Akaike
+# Information Criterion, or AICc.
+#
+# AICc adds a stronger penalty for model complexity when the
+# sample size is small. Lower AICc values indicate greater
+# support relative to the other candidate models.
+#
+# The function returns NA when the model contains too many
+# parameters for AICc to be calculated safely.
+
+calculate_AICc <- function(model) {
+
+  n <- stats::nobs(model)
+
+  # logLik degrees of freedom include regression coefficients
+  # and the estimated residual variance.
+  k <- attr(
+    stats::logLik(model),
+    "df"
+  )
+
+  denominator <- n - k - 1
+
+  if (denominator <= 0) {
+    return(NA_real_)
+  }
+
+  stats::AIC(model) +
+    (
+      2 * k * (k + 1)
+    ) /
+    denominator
+}
+```
+
+```{r}
+# Fit an intercept-only baseline model.
+#
+# This model predicts the same mean MEblack value for every event.
+# It provides the simplest possible reference model.
+
+MEblack_mean_model <- lm(
+  MEblack ~ 1,
+  data = MEblack_model_data
+)
+
+
+# Fit the primary salinity model.
+
+MEblack_salinity_model <- lm(
+  MEblack ~ salinity,
+  data = MEblack_model_data
+)
+
+
+# Fit the conductivity sensitivity model.
+
+MEblack_conductivity_model <- lm(
+  MEblack ~ conductivity_per_1000,
+  data = MEblack_model_data
+)
+
+
+# Fit a categorical month model.
+#
+# June is the reference month because the month factor was
+# previously ordered as June, July, and August.
+
+MEblack_month_model <- lm(
+  MEblack ~ month,
+  data = MEblack_model_data
+)
+
+
+# Fit a categorical location model.
+#
+# CMT is the reference location because the location factor was
+# previously ordered as CMT followed by DAF.
+
+MEblack_location_model <- lm(
+  MEblack ~ location,
+  data = MEblack_model_data
+)
+
+
+# Test whether location provides additional information after
+# accounting for salinity.
+
+MEblack_salinity_location_model <- lm(
+  MEblack ~ salinity + location,
+  data = MEblack_model_data
+)
+
+
+# Test salinity and conductivity together.
+#
+# These predictors are expected to be highly correlated, so this
+# model is included mainly as a multicollinearity diagnostic.
+# Individual coefficients should be interpreted cautiously.
+
+MEblack_salinity_conductivity_model <- lm(
+  MEblack ~ salinity + conductivity_per_1000,
+  data = MEblack_model_data
+)
+```
+
+```{r}
+# Store all candidate models in a named list.
+#
+# This allows us to summarize every model consistently without
+# writing separate extraction code for each one.
+
+MEblack_linear_models <- list(
+  "Mean baseline" =
+    MEblack_mean_model,
+
+  "Salinity" =
+    MEblack_salinity_model,
+
+  "Conductivity" =
+    MEblack_conductivity_model,
+
+  "Month" =
+    MEblack_month_model,
+
+  "Location" =
+    MEblack_location_model,
+
+  "Salinity + location" =
+    MEblack_salinity_location_model,
+
+  "Salinity + conductivity" =
+    MEblack_salinity_conductivity_model
+)
+
+names(MEblack_linear_models)
+```
+
+```{r}
+# Define a function that extracts the same fit statistics from
+# every candidate linear model.
+#
+# RMSE and MAE calculated here describe in-sample residual error.
+# They should not be treated as out-of-sample performance.
+# Cross-validated RMSE and MAE will be calculated later.
+
+summarize_linear_model <- function(model, model_name) {
+
+  model_glance <- broom::glance(model)
+
+  tibble::tibble(
+    model = model_name,
+
+    formula = paste(
+      deparse(stats::formula(model)),
+      collapse = ""
+    ),
+
+    n = stats::nobs(model),
+
+    estimated_parameters = attr(
+      stats::logLik(model),
+      "df"
+    ),
+
+    R_squared =
+      model_glance$r.squared,
+
+    adjusted_R_squared =
+      model_glance$adj.r.squared,
+
+    residual_standard_error =
+      model_glance$sigma,
+
+    model_p_value =
+      model_glance$p.value,
+
+    AIC =
+      stats::AIC(model),
+
+    AICc =
+      calculate_AICc(model),
+
+    training_RMSE = sqrt(
+      mean(
+        stats::residuals(model)^2
+      )
+    ),
+
+    training_MAE = mean(
+      abs(
+        stats::residuals(model)
+      )
+    )
+  )
+}
+```
+
+```{r}
+# Confirm that every element in the candidate-model list
+# is an fitted linear-model object rather than a character label.
+
+tibble::tibble(
+  model_name = names(MEblack_linear_models),
+
+  object_class = purrr::map_chr(
+    MEblack_linear_models,
+    ~ paste(class(.x), collapse = ", ")
+  )
+)
+```
+
+```{r}
+# Summarize each candidate model using explicit model and label
+# arguments.
+#
+# Using map2_dfr() here prevents the model name, such as
+# "Mean baseline," from accidentally being interpreted as a
+# statistical formula.
+
+MEblack_linear_model_comparison <- purrr::map2_dfr(
+  .x = unname(MEblack_linear_models),
+  .y = names(MEblack_linear_models),
+
+  .f = function(fitted_model, model_label) {
+
+    # Confirm that the current object is a fitted linear model.
+    stopifnot(
+      inherits(fitted_model, "lm")
+    )
+
+    # Extract model-level statistics using broom.
+    model_glance <- broom::glance(
+      fitted_model
+    )
+
+    tibble::tibble(
+      model = model_label,
+
+      # Store the model formula as readable text.
+      formula_text = paste(
+        deparse(
+          stats::formula(fitted_model)
+        ),
+        collapse = " "
+      ),
+
+      n = stats::nobs(
+        fitted_model
+      ),
+
+      estimated_parameters = attr(
+        stats::logLik(fitted_model),
+        "df"
+      ),
+
+      R_squared =
+        model_glance$r.squared,
+
+      adjusted_R_squared =
+        model_glance$adj.r.squared,
+
+      residual_standard_error =
+        model_glance$sigma,
+
+      model_p_value =
+        model_glance$p.value,
+
+      AIC =
+        stats::AIC(fitted_model),
+
+      AICc =
+        calculate_AICc(fitted_model),
+
+      # These are descriptive training errors only.
+      # Predictive errors will be calculated later with LOOCV.
+      training_RMSE = sqrt(
+        mean(
+          stats::residuals(fitted_model)^2
+        )
+      ),
+
+      training_MAE = mean(
+        abs(
+          stats::residuals(fitted_model)
+        )
+      )
+    )
+  }
+) %>%
+
+  # Calculate each model's AICc difference from the
+  # lowest-AICc model.
+  dplyr::mutate(
+    delta_AICc = AICc - min(
+      AICc,
+      na.rm = TRUE
+    )
+  ) %>%
+
+  # Display the best-supported model first.
+  dplyr::arrange(
+    delta_AICc
+  )
+
+MEblack_linear_model_comparison
+```
+
+```{r}
+# Extract coefficient estimates, standard errors, p-values,
+# and confidence intervals from every fitted model.
+
+MEblack_linear_coefficients <- purrr::map2_dfr(
+  .x = unname(MEblack_linear_models),
+  .y = names(MEblack_linear_models),
+
+  .f = function(fitted_model, model_label) {
+
+    broom::tidy(
+      fitted_model,
+      conf.int = TRUE,
+      conf.level = 0.95
+    ) %>%
+      dplyr::mutate(
+        model = model_label,
+        .before = 1
+      )
+  }
+)
+
+MEblack_linear_coefficients
+```
+
+```{r}
+# Extract coefficient estimates, standard errors, p-values, and
+# 95% confidence intervals from every candidate linear model.
+
+MEblack_linear_coefficients <- purrr::imap_dfr(
+  MEblack_linear_models,
+  function(model, model_name) {
+
+    broom::tidy(
+      model,
+      conf.int = TRUE,
+      conf.level = 0.95
+    ) %>%
+      dplyr::mutate(
+        model = model_name,
+        .before = 1
+      )
+  }
+)
+
+MEblack_linear_coefficients
+```
+
+```{r}
+# Display only non-intercept coefficients for easier comparison.
+
+MEblack_predictor_coefficients <-
+  MEblack_linear_coefficients %>%
+  dplyr::filter(
+    term != "(Intercept)"
+  )
+
+MEblack_predictor_coefficients
+```
+
+```{r}
+# Calculate both Pearson and Spearman correlations between
+# salinity and conductivity.
+#
+# Pearson correlation measures the strength of their linear
+# relationship, while Spearman correlation measures whether
+# their rankings change together.
+
+salinity_conductivity_correlations <- tibble::tibble(
+  method = c(
+    "Pearson",
+    "Spearman"
+  ),
+
+  correlation = c(
+    stats::cor(
+      MEblack_model_data$salinity,
+      MEblack_model_data$conductivity,
+      method = "pearson"
+    ),
+
+    stats::cor(
+      MEblack_model_data$salinity,
+      MEblack_model_data$conductivity,
+      method = "spearman"
+    )
+  )
+)
+
+salinity_conductivity_correlations
+```
+
+```{r}
+# Calculate the variance inflation factor manually.
+#
+# With two predictors, VIF can be calculated as:
+#
+# VIF = 1 / (1 - R-squared)
+#
+# where R-squared comes from predicting one environmental
+# variable from the other.
+#
+# A very large VIF indicates that salinity and conductivity
+# contain nearly the same information.
+
+salinity_from_conductivity_model <- lm(
+  salinity ~ conductivity_per_1000,
+  data = MEblack_model_data
+)
+
+salinity_conductivity_R_squared <-
+  summary(
+    salinity_from_conductivity_model
+  )$r.squared
+
+salinity_conductivity_VIF <-
+  1 / (
+    1 - salinity_conductivity_R_squared
+  )
+
+salinity_conductivity_diagnostics <- tibble::tibble(
+  predictor_pair = "Salinity and conductivity",
+  R_squared_between_predictors =
+    salinity_conductivity_R_squared,
+  VIF =
+    salinity_conductivity_VIF
+)
+
+salinity_conductivity_diagnostics
+```
+
+```{r}
+# Inspect the salinity-plus-conductivity model.
+#
+# We are looking for signs of multicollinearity such as:
+# - unusually large standard errors
+# - unstable coefficient directions
+# - nonsignificant individual coefficients despite excellent fit
+# - coefficients that differ substantially from the single-
+#   predictor models
+
+summary(
+  MEblack_salinity_conductivity_model
+)
+```
+
+```{r}
+# Display the combined model coefficients with confidence
+# intervals in a clean table.
+
+MEblack_salinity_conductivity_coefficients <-
+  broom::tidy(
+    MEblack_salinity_conductivity_model,
+    conf.int = TRUE,
+    conf.level = 0.95
+  )
+
+MEblack_salinity_conductivity_coefficients
+```
+
+```{r}
+# Check whether R considers any coefficients perfectly redundant.
+#
+# An empty or NULL result means that no predictor was perfectly
+# collinear enough to be automatically removed, although severe
+# near-collinearity may still be present.
+
+alias(
+  MEblack_salinity_conductivity_model
+)
+```
+
+```{r}
+# Test whether adding location significantly improves the
+# salinity-only model.
+#
+# These models are nested because the larger model contains all
+# terms from the salinity-only model plus location.
+
+MEblack_salinity_location_test <- anova(
+  MEblack_salinity_model,
+  MEblack_salinity_location_model
+)
+
+MEblack_salinity_location_test
+```
+
+```{r}
+# Compare the salinity-only model with the model that also
+# contains conductivity.
+#
+# This test should be interpreted cautiously because salinity
+# and conductivity are expected to be highly collinear.
+
+MEblack_salinity_conductivity_test <- anova(
+  MEblack_salinity_model,
+  MEblack_salinity_conductivity_model
+)
+
+MEblack_salinity_conductivity_test
+```
+
+```{r}
+# Save the full-data model comparison and coefficient tables.
+#
+# Cross-validated performance results will be saved separately
+# after leave-one-event-out validation is completed.
+
+readr::write_csv(
+  MEblack_linear_model_comparison,
+  "MEblack_linear_full_data_comparison.csv"
+)
+
+readr::write_csv(
+  MEblack_linear_coefficients,
+  "MEblack_linear_coefficients.csv"
+)
+
+readr::write_csv(
+  salinity_conductivity_diagnostics,
+  "MEblack_salinity_conductivity_diagnostics.csv"
+)
+```
+
+# Leave-One-Event-Out Validation for Linear Models
+
+Full-data model fit can appear overly strong when evaluated using the same observations used to estimate the model. Leave-one-event-out cross-validation evaluates whether each model can predict an event that was not used during model fitting.
+
+For each candidate model:
+
+1.  One collection event is held out.
+2.  The model is trained using the remaining five events.
+3.  MEblack is predicted for the held-out event.
+4.  The process is repeated until every event has been held out once.
+
+Salinity and conductivity are evaluated in separate models because they are nearly perfectly correlated.
+
+```{r}
+# Define the models included in the predictive comparison.
+#
+# Each entry is stored as an R formula. The salinity-plus-
+# conductivity model is excluded because those predictors are
+# nearly perfectly collinear and do not provide independent
+# information.
+
+MEblack_LOEO_formulas <- list(
+  "Mean baseline" =
+    MEblack ~ 1,
+
+  "Salinity" =
+    MEblack ~ salinity,
+
+  "Conductivity" =
+    MEblack ~ conductivity_per_1000,
+
+  "Month" =
+    MEblack ~ month,
+
+  "Location" =
+    MEblack ~ location,
+
+  "Salinity + location" =
+    MEblack ~ salinity + location
+)
+
+names(MEblack_LOEO_formulas)
+```
+
+```{r}
+# Define a function that performs leave-one-event-out validation
+# for one model formula.
+#
+# The function:
+# - removes one event
+# - fits the model using the other five events
+# - predicts MEblack for the removed event
+# - repeats the process for all six events
+
+run_linear_LOEO <- function(
+    data,
+    model_formula,
+    model_label
+) {
+
+  purrr::map_dfr(
+    seq_len(nrow(data)),
+    function(test_index) {
+
+      # Use five events for model training.
+      training_data <- data[
+        -test_index,
+        ,
+        drop = FALSE
+      ]
+
+      # Use the remaining event as the test observation.
+      testing_data <- data[
+        test_index,
+        ,
+        drop = FALSE
+      ]
+
+      # Fit the candidate model without using the held-out event.
+      fitted_model <- stats::lm(
+        formula = model_formula,
+        data = training_data
+      )
+
+      # Predict MEblack for the held-out event.
+      held_out_prediction <- stats::predict(
+        fitted_model,
+        newdata = testing_data
+      )
+
+      # Return one row containing the observed and predicted
+      # MEblack values for this validation fold.
+      tibble::tibble(
+        model = model_label,
+        event_id = testing_data$event_id,
+        location = testing_data$location,
+        month = testing_data$month,
+        observed_MEblack = testing_data$MEblack,
+        predicted_MEblack = as.numeric(
+          held_out_prediction
+        ),
+        residual =
+          testing_data$MEblack -
+          as.numeric(held_out_prediction)
+      )
+    }
+  )
+}
+```
+
+```{r}
+# Apply the leave-one-event-out function to every candidate
+# linear model.
+#
+# unname() supplies the formula objects, while names() supplies
+# their readable model labels. Keeping these arguments separate
+# prevents labels such as "Mean baseline" from being interpreted
+# as R formulas.
+
+MEblack_linear_LOEO_predictions <- purrr::map2_dfr(
+  .x = unname(
+    MEblack_LOEO_formulas
+  ),
+
+  .y = names(
+    MEblack_LOEO_formulas
+  ),
+
+  .f = function(
+      model_formula,
+      model_label
+  ) {
+
+    run_linear_LOEO(
+      data = MEblack_model_data,
+      model_formula = model_formula,
+      model_label = model_label
+    )
+  }
+)
+
+MEblack_linear_LOEO_predictions
+
+```
+
+```{r}
+# Confirm that each model produced exactly one held-out
+# prediction for every collection event.
+
+MEblack_LOEO_prediction_counts <-
+  MEblack_linear_LOEO_predictions %>%
+  dplyr::count(
+    model,
+    name = "number_of_predictions"
+  )
+
+MEblack_LOEO_prediction_counts
+```
+
+```{r}
+# Stop if any model failed to generate all six predictions or
+# produced a missing prediction.
+
+stopifnot(
+  all(
+    MEblack_LOEO_prediction_counts$number_of_predictions == 6
+  ),
+
+  !anyNA(
+    MEblack_linear_LOEO_predictions$predicted_MEblack
+  )
+)
+```
+
+```{r}
+# Summarize predictive performance using the six held-out
+# predictions from each model.
+#
+# RMSE:
+# Penalizes larger prediction errors more strongly.
+#
+# MAE:
+# Represents the average absolute prediction error.
+#
+# Prediction bias:
+# Positive values indicate systematic overprediction, while
+# negative values indicate systematic underprediction.
+#
+# Predictive R-squared:
+# Compares the model's held-out prediction error with variation
+# around the overall observed mean. It can be negative when a
+# model predicts held-out observations worse than the baseline.
+
+MEblack_linear_LOEO_performance <-
+  MEblack_linear_LOEO_predictions %>%
+  dplyr::group_by(
+    model
+  ) %>%
+  dplyr::summarise(
+    n_predictions = dplyr::n(),
+
+    RMSE = sqrt(
+      mean(
+        (
+          observed_MEblack -
+          predicted_MEblack
+        )^2
+      )
+    ),
+
+    MAE = mean(
+      abs(
+        observed_MEblack -
+        predicted_MEblack
+      )
+    ),
+
+    prediction_bias = mean(
+      predicted_MEblack -
+      observed_MEblack
+    ),
+
+    predictive_R_squared =
+      1 -
+      sum(
+        (
+          observed_MEblack -
+          predicted_MEblack
+        )^2
+      ) /
+      sum(
+        (
+          observed_MEblack -
+          mean(observed_MEblack)
+        )^2
+      ),
+
+    .groups = "drop"
+  ) %>%
+  dplyr::arrange(
+    RMSE
+  )
+
+MEblack_linear_LOEO_performance
+```
+
+```{r}
+# Extract the baseline cross-validated RMSE.
+#
+# Every candidate model should ideally produce a lower RMSE
+# than this intercept-only reference model.
+
+baseline_LOEO_RMSE <-
+  MEblack_linear_LOEO_performance %>%
+  dplyr::filter(
+    model == "Mean baseline"
+  ) %>%
+  dplyr::pull(
+    RMSE
+  )
+```
+
+```{r}
+# Calculate the percentage improvement in RMSE relative to the
+# mean-only baseline.
+#
+# Positive percentages indicate improvement over the baseline.
+# Negative percentages indicate worse held-out prediction.
+
+MEblack_linear_LOEO_performance <-
+  MEblack_linear_LOEO_performance %>%
+  dplyr::mutate(
+    RMSE_improvement_over_baseline_percent =
+      100 *
+      (
+        baseline_LOEO_RMSE - RMSE
+      ) /
+      baseline_LOEO_RMSE
+  ) %>%
+  dplyr::arrange(
+    RMSE
+  )
+
+MEblack_linear_LOEO_performance
+```
+
+```{r}
+# Arrange the prediction table by model and event.
+#
+# This helps identify whether a model performs poorly because of
+# one especially difficult collection event.
+
+MEblack_linear_LOEO_predictions %>%
+  dplyr::arrange(
+    model,
+    month,
+    location
+  )
+```
+
+```{r}
+# Rank held-out predictions by absolute error.
+#
+# Events at the top of this table have the greatest difference
+# between observed and predicted MEblack values.
+
+MEblack_largest_LOEO_errors <-
+  MEblack_linear_LOEO_predictions %>%
+  dplyr::mutate(
+    absolute_error = abs(
+      residual
+    )
+  ) %>%
+  dplyr::arrange(
+    dplyr::desc(
+      absolute_error
+    )
+  )
+
+MEblack_largest_LOEO_errors
+```
+
+```{r}
+# Plot held-out predictions against observed MEblack values.
+#
+# The dashed diagonal line represents perfect prediction.
+# Points closer to this line indicate better out-of-sample
+# performance.
+
+MEblack_linear_LOEO_prediction_plot <-
+  MEblack_linear_LOEO_predictions %>%
+  ggplot2::ggplot(
+    ggplot2::aes(
+      x = observed_MEblack,
+      y = predicted_MEblack
+    )
+  ) +
+  ggplot2::geom_abline(
+    intercept = 0,
+    slope = 1,
+    linetype = "dashed",
+    linewidth = 0.7
+  ) +
+  ggplot2::geom_point(
+    ggplot2::aes(
+      shape = location
+    ),
+    size = 3
+  ) +
+  ggplot2::geom_text(
+    ggplot2::aes(
+      label = event_id
+    ),
+    nudge_y = 0.025,
+    check_overlap = TRUE,
+    size = 2.5
+  ) +
+  ggplot2::facet_wrap(
+    ~ model,
+    ncol = 2
+  ) +
+  ggplot2::labs(
+    title = "Leave-one-event-out prediction of MEblack",
+    subtitle = paste(
+      "Each point was predicted by a model trained",
+      "on the other five collection events"
+    ),
+    x = "Observed MEblack",
+    y = "Held-out predicted MEblack",
+    shape = "Location"
+  ) +
+  ggplot2::theme_classic(
+    base_size = 11
+  ) +
+  ggplot2::theme(
+    plot.title = ggplot2::element_text(
+      face = "bold"
+    ),
+    legend.position = "bottom"
+  )
+
+MEblack_linear_LOEO_prediction_plot
+```
+
+```{r}
+# Compare cross-validated RMSE across the candidate models.
+#
+# Lower bars indicate more accurate held-out predictions.
+
+MEblack_linear_LOEO_RMSE_plot <-
+  MEblack_linear_LOEO_performance %>%
+  dplyr::mutate(
+    model = forcats::fct_reorder(
+      model,
+      RMSE
+    )
+  ) %>%
+  ggplot2::ggplot(
+    ggplot2::aes(
+      x = model,
+      y = RMSE
+    )
+  ) +
+  ggplot2::geom_col() +
+  ggplot2::geom_text(
+    ggplot2::aes(
+      label = round(
+        RMSE,
+        3
+      )
+    ),
+    hjust = -0.15,
+    size = 3.5
+  ) +
+  ggplot2::coord_flip(
+    clip = "off"
+  ) +
+  ggplot2::labs(
+    title = "Linear-model leave-one-event-out performance",
+    subtitle = "Lower RMSE indicates better held-out prediction",
+    x = NULL,
+    y = "LOEO RMSE"
+  ) +
+  ggplot2::theme_classic(
+    base_size = 12
+  ) +
+  ggplot2::theme(
+    plot.title = ggplot2::element_text(
+      face = "bold"
+    ),
+    plot.margin = ggplot2::margin(
+      5.5,
+      35,
+      5.5,
+      5.5
+    )
+  )
+
+MEblack_linear_LOEO_RMSE_plot
+```
+
+```{r}
+# Save the event-level held-out predictions and the summarized
+# cross-validated performance table.
+
+readr::write_csv(
+  MEblack_linear_LOEO_predictions,
+  "MEblack_linear_LOEO_predictions.csv"
+)
+
+readr::write_csv(
+  MEblack_linear_LOEO_performance,
+  "MEblack_linear_LOEO_performance.csv"
+)
+```
+
+```{r}
+# Save the two primary linear-validation figures.
+
+ggplot2::ggsave(
+  filename =
+    "MEblack_linear_LOEO_observed_vs_predicted.png",
+  plot =
+    MEblack_linear_LOEO_prediction_plot,
+  width = 10,
+  height = 11,
+  dpi = 300
+)
+
+ggplot2::ggsave(
+  filename =
+    "MEblack_linear_LOEO_RMSE.png",
+  plot =
+    MEblack_linear_LOEO_RMSE_plot,
+  width = 8,
+  height = 5,
+  dpi = 300
+)
+```
+
+### Linear LOEO Interpretation
+
+The salinity-plus-location model produced the lowest leave-one-event-out RMSE, followed closely by the conductivity-only and salinity-only models. This suggests that salinity explained most of the variation in MEblack, while location may provide a smaller additional adjustment between DAF and CMT.
+
+Location alone performed worse than the mean-only baseline, indicating that location was not sufficient to explain MEblack without environmental information. Because only six independent events were available and the performance differences among the top models were small, these rankings should be interpreted as exploratory.
+
+# Random Forest Leave-One-Event-Out Validation
+
+Random forest regression is used as an exploratory nonlinear modeling approach. The models are evaluated using the same leave-one-event-out procedure used for the linear models so that their predictive performance can be compared fairly.
+
+Because the dataset contains only six independent events, no hyperparameter tuning is performed. Each forest uses a fixed configuration and is evaluated only through held-out predictions.
+
+```{r}
+# Check whether the randomForest package is available in the
+# current DCC R environment.
+#
+# TRUE means that the package is ready to use.
+
+randomForest_available <- requireNamespace(
+  "randomForest",
+  quietly = TRUE
+)
+
+randomForest_available
+```
+
+```{r}
+# Create a version-specific package-library path inside the
+# project's DCC storage.
+#
+# Keeping separate folders for different R versions helps avoid
+# compatibility problems with compiled packages.
+
+R_major_minor <- paste0(
+  R.version$major,
+  ".",
+  strsplit(
+    R.version$minor,
+    split = "\\."
+  )[[1]][1]
+)
+
+project_R_library <- file.path(
+  "/work/clh162/Data+/Arushi/R_library",
+  paste0(
+    "R-",
+    R_major_minor
+  )
+)
+
+# Create the package directory if it does not already exist.
+
+dir.create(
+  project_R_library,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+project_R_library
+```
+
+```{r}
+# Add the project-specific library to the beginning of R's
+# package search paths.
+#
+# This tells R to look here first when loading packages.
+
+.libPaths(
+  unique(
+    c(
+      project_R_library,
+      .libPaths()
+    )
+  )
+)
+
+# Display the active package-library paths.
+
+.libPaths()
+```
+
+```{r}
+# Use Duke's CRAN mirror for package installation on the DCC.
+
+options(
+  repos = c(
+    CRAN = "https://archive.linux.duke.edu/cran/"
+  )
+)
+
+# Install randomForest only when it is not already available
+# in the project-specific package library.
+
+if (
+  !requireNamespace(
+    "randomForest",
+    quietly = TRUE
+  )
+) {
+
+  install.packages(
+    "randomForest",
+    lib = project_R_library,
+    dependencies = TRUE
+  )
+}
+```
+
+```{r}
+# Confirm that R can now locate the installed package.
+
+randomForest_available <- requireNamespace(
+  "randomForest",
+  quietly = TRUE
+)
+
+randomForest_available
+```
+
+```{r}
+# Load randomForest from the project-specific package library.
+
+library(
+  randomForest,
+  lib.loc = project_R_library
+)
+
+# Record the installed package version for reproducibility.
+
+packageVersion(
+  "randomForest"
+)
+```
+
+```{r}
+# Restore the project-specific package library whenever this
+# notebook is opened in a new R session.
+
+R_major_minor <- paste0(
+  R.version$major,
+  ".",
+  strsplit(
+    R.version$minor,
+    split = "\\."
+  )[[1]][1]
+)
+
+project_R_library <- file.path(
+  "/work/clh162/Data+/Arushi/R_library",
+  paste0(
+    "R-",
+    R_major_minor
+  )
+)
+
+.libPaths(
+  unique(
+    c(
+      project_R_library,
+      .libPaths()
+    )
+  )
+)
+```
+
+```{r}
+# Define the random forest models included in the comparison.
+#
+# Salinity and conductivity are modeled separately because they
+# are nearly perfectly correlated.
+#
+# Salinity plus location is included because that combination
+# produced the lowest RMSE among the linear LOEO models.
+
+MEblack_RF_formulas <- list(
+  "Random forest: salinity" =
+    MEblack ~ salinity,
+
+  "Random forest: conductivity" =
+    MEblack ~ conductivity_per_1000,
+
+  "Random forest: salinity + location" =
+    MEblack ~ salinity + location
+)
+
+names(MEblack_RF_formulas)
+```
+
+```{r}
+# Define a function that performs leave-one-event-out validation
+# for one random forest model.
+#
+# For each of the six folds, the function:
+# - holds out one event
+# - trains a forest on the other five events
+# - predicts MEblack for the held-out event
+# - records the observed and predicted values
+#
+# A different but reproducible seed is used for each fold.
+
+run_random_forest_LOEO <- function(
+    data,
+    model_formula,
+    model_label,
+    base_seed = 20260723,
+    number_of_trees = 2000
+) {
+
+  # Count the predictors in the supplied model formula.
+  #
+  # This value is used as mtry so that all predictors are
+  # considered at each split. With only one or two predictors,
+  # additional mtry tuning would not be meaningful.
+  predictor_names <- all.vars(model_formula)[-1]
+
+  mtry_value <- max(
+    1,
+    length(predictor_names)
+  )
+
+  purrr::map_dfr(
+    seq_len(nrow(data)),
+    function(test_index) {
+
+      # Use five events as the training data.
+      training_data <- data[
+        -test_index,
+        ,
+        drop = FALSE
+      ]
+
+      # Use the remaining event as the held-out test data.
+      testing_data <- data[
+        test_index,
+        ,
+        drop = FALSE
+      ]
+
+      # Set a reproducible seed for this validation fold.
+      set.seed(
+        base_seed + test_index
+      )
+
+      # Fit the random forest regression model.
+      #
+      # nodesize = 1 allows terminal nodes containing one
+      # observation. This is necessary because each training
+      # dataset contains only five events.
+      #
+      # Out-of-bag error is not used as the primary evaluation
+      # measure because the training sample is extremely small.
+      fitted_forest <- randomForest::randomForest(
+        formula = model_formula,
+        data = training_data,
+        ntree = number_of_trees,
+        mtry = mtry_value,
+        nodesize = 1,
+        importance = TRUE
+      )
+
+      # Predict MEblack for the event that was excluded from
+      # model training.
+      held_out_prediction <- stats::predict(
+        fitted_forest,
+        newdata = testing_data
+      )
+
+      # Return one prediction row for this validation fold.
+      tibble::tibble(
+        model = model_label,
+        model_family = "Random forest",
+        event_id = testing_data$event_id,
+        location = testing_data$location,
+        month = testing_data$month,
+        observed_MEblack = testing_data$MEblack,
+        predicted_MEblack = as.numeric(
+          held_out_prediction
+        ),
+        residual =
+          testing_data$MEblack -
+          as.numeric(held_out_prediction)
+      )
+    }
+  )
+}
+```
+
+```{r}
+# Run leave-one-event-out validation for every random forest
+# candidate model.
+#
+# Each model receives a different base seed so that its results
+# are reproducible without forcing all forests to use identical
+# bootstrap samples.
+
+MEblack_RF_LOEO_predictions <- purrr::map2_dfr(
+  .x = seq_along(
+    MEblack_RF_formulas
+  ),
+
+  .y = names(
+    MEblack_RF_formulas
+  ),
+
+  .f = function(
+      model_index,
+      model_label
+  ) {
+
+    run_random_forest_LOEO(
+      data = MEblack_model_data,
+
+      model_formula =
+        MEblack_RF_formulas[[model_index]],
+
+      model_label =
+        model_label,
+
+      base_seed =
+        20260723 + 1000 * model_index,
+
+      number_of_trees =
+        2000
+    )
+  }
+)
+
+MEblack_RF_LOEO_predictions
+```
+
+```{r}
+# Confirm that every random forest model generated one held-out
+# prediction for each of the six independent events.
+
+MEblack_RF_prediction_counts <-
+  MEblack_RF_LOEO_predictions %>%
+  dplyr::count(
+    model,
+    name = "number_of_predictions"
+  )
+
+MEblack_RF_prediction_counts
+```
+
+```{r}
+# Stop if a model failed to predict all six events or produced
+# any missing prediction values.
+
+stopifnot(
+  all(
+    MEblack_RF_prediction_counts$number_of_predictions == 6
+  ),
+
+  !anyNA(
+    MEblack_RF_LOEO_predictions$predicted_MEblack
+  )
+)
+```
+
+```{r}
+# Calculate held-out prediction metrics for each forest.
+#
+# Lower RMSE and MAE indicate better prediction.
+#
+# Predictive R-squared can be negative when a model performs
+# worse than predicting around the overall observed mean.
+
+MEblack_RF_LOEO_performance <-
+  MEblack_RF_LOEO_predictions %>%
+  dplyr::group_by(
+    model,
+    model_family
+  ) %>%
+  dplyr::summarise(
+    n_predictions = dplyr::n(),
+
+    RMSE = sqrt(
+      mean(
+        (
+          observed_MEblack -
+          predicted_MEblack
+        )^2
+      )
+    ),
+
+    MAE = mean(
+      abs(
+        observed_MEblack -
+        predicted_MEblack
+      )
+    ),
+
+    prediction_bias = mean(
+      predicted_MEblack -
+      observed_MEblack
+    ),
+
+    predictive_R_squared =
+      1 -
+      sum(
+        (
+          observed_MEblack -
+          predicted_MEblack
+        )^2
+      ) /
+      sum(
+        (
+          observed_MEblack -
+          mean(observed_MEblack)
+        )^2
+      ),
+
+    .groups = "drop"
+  ) %>%
+  dplyr::mutate(
+    RMSE_improvement_over_baseline_percent =
+      100 *
+      (
+        baseline_LOEO_RMSE - RMSE
+      ) /
+      baseline_LOEO_RMSE
+  ) %>%
+  dplyr::arrange(
+    RMSE
+  )
+
+MEblack_RF_LOEO_performance
+```
+
+```{r}
+# Add a model-family label to the existing linear results.
+
+MEblack_linear_LOEO_performance_labeled <-
+  MEblack_linear_LOEO_performance %>%
+  dplyr::mutate(
+    model_family = "Linear model"
+  )
+```
+
+```{r}
+# Combine all linear and random forest performance metrics into
+# one directly comparable ranking.
+#
+# Every model was evaluated using the same six held-out events.
+
+MEblack_all_LOEO_performance <-
+  dplyr::bind_rows(
+    MEblack_linear_LOEO_performance_labeled,
+    MEblack_RF_LOEO_performance
+  ) %>%
+  dplyr::arrange(
+    RMSE
+  )
+
+MEblack_all_LOEO_performance
+```
+
+```{r}
+# Identify which events were most difficult for the random
+# forest models to predict.
+
+MEblack_RF_largest_errors <-
+  MEblack_RF_LOEO_predictions %>%
+  dplyr::mutate(
+    absolute_error = abs(
+      residual
+    )
+  ) %>%
+  dplyr::arrange(
+    dplyr::desc(
+      absolute_error
+    )
+  )
+
+MEblack_RF_largest_errors
+```
+
+```{r}
+# Save the random forest held-out predictions.
+
+readr::write_csv(
+  MEblack_RF_LOEO_predictions,
+  "MEblack_random_forest_LOEO_predictions.csv"
+)
+
+# Save the random forest performance summary.
+
+readr::write_csv(
+  MEblack_RF_LOEO_performance,
+  "MEblack_random_forest_LOEO_performance.csv"
+)
+
+# Save the complete linear and random forest comparison.
+
+readr::write_csv(
+  MEblack_all_LOEO_performance,
+  "MEblack_all_LOEO_model_comparison.csv"
+)
+```
+
+### Random Forest Interpretation
+
+The linear models substantially outperformed the random forest models during leave-one-event-out validation. The salinity-plus-location linear model produced the lowest prediction error (`RMSE = 0.041`), compared with `RMSE = 0.109` for the best-performing random forest model.
+
+Although the random forest models predicted MEblack better than the mean-only baseline, they did not improve upon the simpler linear models. This suggests that the observed relationship between MEblack and salinity or conductivity was largely linear and did not require a more complex nonlinear model.
+
+The poorer random forest performance was also likely influenced by the small sample size, as each validation forest was trained using only five independent collection events. Therefore, linear regression was the more appropriate and accurate modeling approach for the available dataset.
+
+# Exact Permutation Testing
+
+Exact permutation tests evaluate how unusual the observed results would be if MEblack were unrelated to the environmental and spatial predictors.
+
+Because there are six independent collection events, there are only `6! = 720` possible arrangements of the MEblack values across those events. All 720 arrangements can therefore be evaluated instead of estimating the null distribution from a random subset of permutations.
+
+The tests in this section evaluate:
+
+1.  The absolute correlation between MEblack and salinity
+2.  The leave-one-event-out RMSE of the salinity linear model
+3.  The leave-one-event-out RMSE of the salinity-plus-location linear model
+
+```{r}
+# Define a recursive function that generates every possible
+# ordering of a supplied vector.
+#
+# For six event indices, this produces exactly:
+#
+# 6! = 720 permutations
+
+generate_all_permutations <- function(x) {
+
+  # A one-element vector has only one possible ordering.
+  if (length(x) == 1) {
+    return(
+      matrix(
+        x,
+        nrow = 1
+      )
+    )
+  }
+
+  # Place each element in the first position and recursively
+  # generate all arrangements of the remaining elements.
+  permutation_blocks <- lapply(
+    seq_along(x),
+    function(index) {
+
+      remaining_permutations <-
+        generate_all_permutations(
+          x[-index]
+        )
+
+      cbind(
+        x[index],
+        remaining_permutations
+      )
+    }
+  )
+
+  do.call(
+    rbind,
+    permutation_blocks
+  )
+}
+```
+
+```{r}
+# Generate all possible rearrangements of the six event rows.
+#
+# Each row contains one complete permutation of the indices
+# 1 through 6.
+
+permutation_indices <- generate_all_permutations(
+  seq_len(
+    nrow(MEblack_model_data)
+  )
+)
+
+dim(permutation_indices)
+
+head(permutation_indices)
+```
+
+```{r}
+# Confirm that exactly 720 unique permutations were generated.
+
+stopifnot(
+  nrow(permutation_indices) == factorial(6),
+
+  nrow(
+    unique(
+      as.data.frame(permutation_indices)
+    )
+  ) == factorial(6)
+)
+```
+
+```{r}
+# Calculate the observed Pearson correlation between MEblack
+# and salinity using the original six-event arrangement.
+
+observed_salinity_correlation <- stats::cor(
+  MEblack_model_data$MEblack,
+  MEblack_model_data$salinity,
+  method = "pearson"
+)
+
+observed_salinity_correlation
+```
+
+```{r}
+# Extract the observed salinity slope from the fitted
+# salinity-only linear model.
+
+observed_salinity_slope <- unname(
+  stats::coef(
+    MEblack_salinity_model
+  )[["salinity"]]
+)
+
+observed_salinity_slope
+```
+
+```{r}
+# Rearrange the MEblack values according to each of the 720
+# possible permutations while keeping salinity fixed.
+#
+# For every arrangement, calculate:
+# - Pearson correlation
+# - linear regression slope
+#
+# Under the null hypothesis, any assignment of MEblack values
+# to the six environmental events is equally plausible.
+
+salinity_permutation_results <- purrr::map_dfr(
+  seq_len(
+    nrow(permutation_indices)
+  ),
+  function(permutation_number) {
+
+    current_indices <-
+      permutation_indices[
+        permutation_number,
+      ]
+
+    permuted_data <- MEblack_model_data %>%
+      dplyr::mutate(
+        MEblack_permuted =
+          MEblack[
+            current_indices
+          ]
+      )
+
+    permuted_model <- stats::lm(
+      MEblack_permuted ~ salinity,
+      data = permuted_data
+    )
+
+    tibble::tibble(
+      permutation_id =
+        permutation_number,
+
+      correlation = stats::cor(
+        permuted_data$MEblack_permuted,
+        permuted_data$salinity,
+        method = "pearson"
+      ),
+
+      slope = unname(
+        stats::coef(
+          permuted_model
+        )[["salinity"]]
+      )
+    )
+  }
+)
+
+salinity_permutation_results
+```
+
+```{r}
+# Calculate a two-sided exact permutation p-value.
+#
+# A permuted result is considered at least as extreme as the
+# observed result when its absolute correlation is greater than
+# or equal to the observed absolute correlation.
+#
+# Because all 720 possible arrangements are included, the exact
+# p-value is the proportion of all permutations meeting this
+# condition.
+
+correlation_tolerance <- 1e-12
+
+number_extreme_correlations <-
+  sum(
+    abs(
+      salinity_permutation_results$correlation
+    ) >=
+      abs(
+        observed_salinity_correlation
+      ) -
+      correlation_tolerance
+  )
+
+exact_salinity_correlation_p <-
+  number_extreme_correlations /
+  nrow(
+    salinity_permutation_results
+  )
+
+exact_salinity_correlation_summary <- tibble::tibble(
+  observed_correlation =
+    observed_salinity_correlation,
+
+  observed_slope =
+    observed_salinity_slope,
+
+  total_permutations =
+    nrow(
+      salinity_permutation_results
+    ),
+
+  permutations_at_least_as_extreme =
+    number_extreme_correlations,
+
+  exact_two_sided_p_value =
+    exact_salinity_correlation_p
+)
+
+exact_salinity_correlation_summary
+```
+
+```{r}
+# Display the smallest p-value that can be resolved using all
+# 720 exact permutations.
+
+1 / factorial(6)
+```
+
+```{r}
+# Plot the null distribution of correlations obtained after
+# assigning MEblack to every possible arrangement of events.
+#
+# The dashed vertical lines show the observed negative
+# correlation and its equally extreme positive counterpart.
+
+salinity_correlation_permutation_plot <-
+  salinity_permutation_results %>%
+  ggplot2::ggplot(
+    ggplot2::aes(
+      x = correlation
+    )
+  ) +
+  ggplot2::geom_histogram(
+    bins = 30,
+    boundary = 0
+  ) +
+  ggplot2::geom_vline(
+    xintercept =
+      observed_salinity_correlation,
+    linetype = "dashed",
+    linewidth = 1
+  ) +
+  ggplot2::geom_vline(
+    xintercept =
+      -observed_salinity_correlation,
+    linetype = "dashed",
+    linewidth = 1
+  ) +
+  ggplot2::labs(
+    title = "Exact permutation test: MEblack and salinity",
+    subtitle = paste0(
+      "Observed r = ",
+      round(
+        observed_salinity_correlation,
+        3
+      ),
+      "; exact two-sided p = ",
+      format.pval(
+        exact_salinity_correlation_p,
+        digits = 3
+      )
+    ),
+    x = "Pearson correlation under permutation",
+    y = "Number of permutations"
+  ) +
+  ggplot2::theme_classic(
+    base_size = 12
+  ) +
+  ggplot2::theme(
+    plot.title = ggplot2::element_text(
+      face = "bold"
+    )
+  )
+
+salinity_correlation_permutation_plot
+```
+
+```{r}
+# Define a compact function that calculates leave-one-event-out
+# RMSE for a supplied linear-model formula.
+#
+# This function is used repeatedly across all 720 permuted
+# versions of the outcome.
+
+calculate_linear_LOEO_RMSE <- function(
+    data,
+    model_formula
+) {
+
+  squared_errors <- purrr::map_dbl(
+    seq_len(
+      nrow(data)
+    ),
+    function(test_index) {
+
+      # Hold out one event.
+      testing_data <- data[
+        test_index,
+        ,
+        drop = FALSE
+      ]
+
+      # Train the model using the remaining five events.
+      training_data <- data[
+        -test_index,
+        ,
+        drop = FALSE
+      ]
+
+      fitted_model <- stats::lm(
+        formula = model_formula,
+        data = training_data
+      )
+
+      held_out_prediction <- stats::predict(
+        fitted_model,
+        newdata = testing_data
+      )
+
+      # Return the squared held-out prediction error.
+      (
+        testing_data$MEblack -
+          as.numeric(
+            held_out_prediction
+          )
+      )^2
+    }
+  )
+
+  sqrt(
+    mean(
+      squared_errors
+    )
+  )
+}
+```
+
+```{r}
+# Recalculate the observed LOEO RMSE values using the same
+# function that will be applied to every permutation.
+#
+# These should match the previously calculated performance
+# table, apart from possible rounding differences.
+
+observed_salinity_LOEO_RMSE <-
+  calculate_linear_LOEO_RMSE(
+    data = MEblack_model_data,
+    model_formula =
+      MEblack ~ salinity
+  )
+
+observed_salinity_location_LOEO_RMSE <-
+  calculate_linear_LOEO_RMSE(
+    data = MEblack_model_data,
+    model_formula =
+      MEblack ~ salinity + location
+  )
+
+tibble::tibble(
+  model = c(
+    "Salinity",
+    "Salinity + location"
+  ),
+
+  observed_LOEO_RMSE = c(
+    observed_salinity_LOEO_RMSE,
+    observed_salinity_location_LOEO_RMSE
+  )
+)
+```
+
+```{r}
+# For each of the 720 permutations:
+#
+# 1. Rearrange MEblack across the six events.
+# 2. Run leave-one-event-out validation for the salinity model.
+# 3. Run leave-one-event-out validation for the
+#    salinity-plus-location model.
+# 4. Record both cross-validated RMSE values.
+#
+# Lower RMSE indicates better predictive performance.
+
+linear_LOEO_permutation_results <- purrr::map_dfr(
+  seq_len(
+    nrow(permutation_indices)
+  ),
+  function(permutation_number) {
+
+    current_indices <-
+      permutation_indices[
+        permutation_number,
+      ]
+
+    permuted_model_data <- MEblack_model_data %>%
+      dplyr::mutate(
+        MEblack =
+          MEblack[
+            current_indices
+          ]
+      )
+
+    tibble::tibble(
+      permutation_id =
+        permutation_number,
+
+      salinity_LOEO_RMSE =
+        calculate_linear_LOEO_RMSE(
+          data = permuted_model_data,
+          model_formula =
+            MEblack ~ salinity
+        ),
+
+      salinity_location_LOEO_RMSE =
+        calculate_linear_LOEO_RMSE(
+          data = permuted_model_data,
+          model_formula =
+            MEblack ~ salinity + location
+        )
+    )
+  }
+)
+
+linear_LOEO_permutation_results
+```
+
+```{r}
+# Count how many permuted outcomes produced LOEO RMSE values
+# as low as or lower than the observed RMSE.
+#
+# Lower RMSE represents a more successful prediction result,
+# so this is a lower-tail permutation test.
+
+RMSE_tolerance <- 1e-12
+
+number_extreme_salinity_RMSE <-
+  sum(
+    linear_LOEO_permutation_results$
+      salinity_LOEO_RMSE <=
+      observed_salinity_LOEO_RMSE +
+      RMSE_tolerance
+  )
+
+number_extreme_salinity_location_RMSE <-
+  sum(
+    linear_LOEO_permutation_results$
+      salinity_location_LOEO_RMSE <=
+      observed_salinity_location_LOEO_RMSE +
+      RMSE_tolerance
+  )
+```
+
+```{r}
+# Calculate exact p-values by dividing the number of equally or
+# more successful permutations by all 720 possible arrangements.
+
+exact_salinity_LOEO_p <-
+  number_extreme_salinity_RMSE /
+  nrow(
+    linear_LOEO_permutation_results
+  )
+
+exact_salinity_location_LOEO_p <-
+  number_extreme_salinity_location_RMSE /
+  nrow(
+    linear_LOEO_permutation_results
+  )
+```
+
+```{r}
+# Create a concise summary table for the two predictive tests.
+
+exact_linear_LOEO_permutation_summary <-
+  tibble::tibble(
+    model = c(
+      "Salinity",
+      "Salinity + location"
+    ),
+
+    observed_LOEO_RMSE = c(
+      observed_salinity_LOEO_RMSE,
+      observed_salinity_location_LOEO_RMSE
+    ),
+
+    total_permutations =
+      nrow(
+        linear_LOEO_permutation_results
+      ),
+
+    permutations_with_equal_or_lower_RMSE = c(
+      number_extreme_salinity_RMSE,
+      number_extreme_salinity_location_RMSE
+    ),
+
+    exact_lower_tail_p_value = c(
+      exact_salinity_LOEO_p,
+      exact_salinity_location_LOEO_p
+    )
+  )
+
+exact_linear_LOEO_permutation_summary
+```
+
+```{r}
+# Convert the permutation results into long format so both
+# model-specific null distributions can be plotted together.
+
+linear_LOEO_permutation_long <-
+  linear_LOEO_permutation_results %>%
+  tidyr::pivot_longer(
+    cols = c(
+      salinity_LOEO_RMSE,
+      salinity_location_LOEO_RMSE
+    ),
+
+    names_to = "model",
+    values_to = "permuted_LOEO_RMSE"
+  ) %>%
+  dplyr::mutate(
+    model = dplyr::recode(
+      model,
+
+      salinity_LOEO_RMSE =
+        "Salinity",
+
+      salinity_location_LOEO_RMSE =
+        "Salinity + location"
+    )
+  )
+```
+
+```{r}
+# Create a table containing the observed RMSE for each model.
+#
+# This table is used to add the dashed reference lines to the
+# faceted permutation plot.
+
+observed_linear_LOEO_RMSE_table <-
+  tibble::tibble(
+    model = c(
+      "Salinity",
+      "Salinity + location"
+    ),
+
+    observed_LOEO_RMSE = c(
+      observed_salinity_LOEO_RMSE,
+      observed_salinity_location_LOEO_RMSE
+    )
+  )
+```
+
+```{r}
+# Plot each model's permutation-based null distribution.
+#
+# The dashed line represents the observed held-out RMSE.
+# An observed line near the far-left tail indicates unusually
+# accurate prediction relative to shuffled outcomes.
+
+linear_LOEO_permutation_plot <-
+  linear_LOEO_permutation_long %>%
+  ggplot2::ggplot(
+    ggplot2::aes(
+      x = permuted_LOEO_RMSE
+    )
+  ) +
+  ggplot2::geom_histogram(
+    bins = 30
+  ) +
+  ggplot2::geom_vline(
+    data =
+      observed_linear_LOEO_RMSE_table,
+
+    ggplot2::aes(
+      xintercept =
+        observed_LOEO_RMSE
+    ),
+
+    linetype = "dashed",
+    linewidth = 1
+  ) +
+  ggplot2::facet_wrap(
+    ~ model,
+    scales = "free_y"
+  ) +
+  ggplot2::labs(
+    title = "Exact permutation tests of LOEO prediction",
+    subtitle = paste(
+      "Dashed lines show observed RMSE;",
+      "lower RMSE indicates better prediction"
+    ),
+    x = "Permuted leave-one-event-out RMSE",
+    y = "Number of permutations"
+  ) +
+  ggplot2::theme_classic(
+    base_size = 12
+  ) +
+  ggplot2::theme(
+    plot.title = ggplot2::element_text(
+      face = "bold"
+    )
+  )
+
+linear_LOEO_permutation_plot
+```
+
+```{r}
+# Save the full 720-permutation correlation results.
+
+readr::write_csv(
+  salinity_permutation_results,
+  "MEblack_salinity_exact_correlation_permutations.csv"
+)
+
+# Save the correlation-test summary.
+
+readr::write_csv(
+  exact_salinity_correlation_summary,
+  "MEblack_salinity_exact_correlation_summary.csv"
+)
+
+# Save the predictive permutation results.
+
+readr::write_csv(
+  linear_LOEO_permutation_results,
+  "MEblack_linear_LOEO_exact_permutations.csv"
+)
+
+# Save the predictive permutation summary.
+
+readr::write_csv(
+  exact_linear_LOEO_permutation_summary,
+  "MEblack_linear_LOEO_exact_permutation_summary.csv"
+)
+```
+
+```{r}
+# Save the two permutation-test figures.
+
+ggplot2::ggsave(
+  filename =
+    "MEblack_salinity_exact_correlation_permutation.png",
+
+  plot =
+    salinity_correlation_permutation_plot,
+
+  width = 8,
+  height = 5,
+  dpi = 300
+)
+
+ggplot2::ggsave(
+  filename =
+    "MEblack_linear_LOEO_exact_permutation.png",
+
+  plot =
+    linear_LOEO_permutation_plot,
+
+  width = 9,
+  height = 5,
+  dpi = 300
+)
+```
+
+### Exact Permutation-Test Interpretation
+
+The observed association between MEblack and salinity was stronger than nearly all possible rearrangements of MEblack across the six collection events. The observed Pearson correlation was `r = -0.978`, and only 7 of the 720 possible permutations produced an absolute correlation at least as large (`exact p = 0.0097`).
+
+The salinity-only linear model also showed unusually strong held-out predictive performance. Only 7 of 720 permutations produced a leave-one-event-out RMSE equal to or lower than the observed value of `0.0458` (`exact p = 0.0097`).
+
+The salinity-plus-location model produced an even lower observed RMSE of `0.0412`, and only 3 of 720 permutations performed equally well or better (`exact p = 0.0042`). However, because this model was selected after comparing multiple candidate models, its result should be interpreted as exploratory rather than as an independent confirmatory test.
+
+Together, these results provide small-sample evidence that the MEblack pattern is meaningfully associated with salinity and that the relationship is not solely the result of one favorable arrangement of the six collection events. These associations do not establish that salinity causally altered gene expression.
+
+# Final Results and Conclusions
+
+## Model Comparison
+
+Linear regression substantially outperformed random forest regression during leave-one-event-out validation. The salinity-plus-location linear model produced the lowest held-out prediction error, followed closely by the conductivity-only and salinity-only linear models.
+
+The random forest models performed better than the mean-only baseline but did not improve upon the simpler linear models. This suggests that the relationship between MEblack and salinity or conductivity was largely linear and did not require a more complex nonlinear model.
+
+## Primary Salinity Result
+
+MEblack showed a strong negative association with salinity (`r = -0.978`). As salinity decreased, the MEblack module eigengene increased.
+
+The exact permutation test evaluated all 720 possible assignments of the six MEblack values to the collection events. Only 7 permutations produced a correlation at least as extreme as the observed relationship (`exact two-sided p = 0.0097`).
+
+The salinity-only linear model also showed strong held-out predictive performance:
+
+-   Leave-one-event-out RMSE: `0.0458`
+-   Predictive R²: `0.891`
+-   Improvement over the mean baseline: `72.5%`
+-   Exact predictive permutation p-value: `0.0097`
+
+These results indicate that the relationship between MEblack and salinity was unlikely to result solely from a favorable arrangement of the six collection events.
+
+## Salinity and Location
+
+The salinity-plus-location model produced the best leave-one-event-out performance:
+
+-   Leave-one-event-out RMSE: `0.0412`
+-   Predictive R²: `0.912`
+-   Improvement over the mean baseline: `75.3%`
+-   Exact predictive permutation p-value: `0.0042`
+
+Location alone performed worse than the mean-only baseline, indicating that location was not sufficient to explain MEblack. Instead, location may provide a smaller adjustment after the primary salinity relationship is accounted for.
+
+Because the salinity-plus-location model was identified after comparing several candidate models, this finding should be interpreted as exploratory and validated with additional collection events.
+
+## Salinity and Conductivity
+
+Salinity and conductivity were nearly perfectly correlated:
+
+-   Pearson correlation: `0.99999`
+-   Spearman correlation: `1.000`
+-   Variance inflation factor: `36,790`
+
+Therefore, the two variables could not be interpreted as independent predictors in the same model. Salinity was retained as the primary predictor because it is more directly interpretable in the context of oyster environmental stress, while conductivity was treated as a separate sensitivity analysis.
+
+## Random Forest Results
+
+The strongest random forest model used conductivity and produced:
+
+-   Leave-one-event-out RMSE: `0.1095`
+-   Predictive R²: `0.378`
+-   Improvement over the mean baseline: `34.3%`
+
+Although the random forest models detected environmental signal, they performed substantially worse than the linear salinity and conductivity models. Each forest was trained using only five independent events, limiting its ability to learn reliable nonlinear patterns.
+
+These results demonstrate that increased model complexity did not improve prediction for the available dataset.
+
+## Overall Conclusion
+
+The analysis provides small-sample evidence that lower salinity was associated with higher MEblack module expression across the six independent collection events. The relationship remained strong during leave-one-event-out validation and exact permutation testing.
+
+The findings support salinity as a potentially important environmental indicator of coordinated gene-expression changes in oysters. However, the study contains only six independent environmental events, environmental conditions are closely connected to month, and the results represent associations rather than causal effects.
+
+Additional years, sites, and collection events are needed to determine whether the MEblack–salinity relationship generalizes beyond the 2024 samples.
+
+```{r}
+# Create one final model-ranking table containing both the
+# linear and random forest leave-one-event-out results.
+#
+# Models are ranked by RMSE because lower held-out prediction
+# error indicates better predictive performance.
+
+MEblack_final_model_ranking <-
+  MEblack_all_LOEO_performance %>%
+  dplyr::arrange(
+    RMSE
+  ) %>%
+  dplyr::mutate(
+    performance_rank =
+      dplyr::row_number(),
+    .before = 1
+  ) %>%
+  dplyr::select(
+    performance_rank,
+    model,
+    model_family,
+    n_predictions,
+    RMSE,
+    MAE,
+    prediction_bias,
+    predictive_R_squared,
+    RMSE_improvement_over_baseline_percent
+  )
+
+MEblack_final_model_ranking
+```
+
+```{r}
+# Save the final ranked comparison table.
+
+readr::write_csv(
+  MEblack_final_model_ranking,
+  "MEblack_final_model_ranking.csv"
+)
+```
+
+```{r}
+# Create a final comparison of held-out RMSE across all linear
+# and random forest models.
+#
+# The dotted horizontal line represents the mean-only baseline.
+# Models below this line predicted better than the baseline.
+
+final_baseline_RMSE <-
+  MEblack_final_model_ranking %>%
+  dplyr::filter(
+    model == "Mean baseline"
+  ) %>%
+  dplyr::pull(
+    RMSE
+  )
+
+MEblack_final_model_comparison_plot <-
+  MEblack_final_model_ranking %>%
+  dplyr::mutate(
+    model = forcats::fct_reorder(
+      model,
+      RMSE
+    )
+  ) %>%
+  ggplot2::ggplot(
+    ggplot2::aes(
+      x = model,
+      y = RMSE,
+      fill = model_family
+    )
+  ) +
+  ggplot2::geom_col() +
+  ggplot2::geom_hline(
+    yintercept = final_baseline_RMSE,
+    linetype = "dotted",
+    linewidth = 0.8
+  ) +
+  ggplot2::geom_text(
+    ggplot2::aes(
+      label = round(
+        RMSE,
+        3
+      )
+    ),
+    hjust = -0.15,
+    size = 3.4
+  ) +
+  ggplot2::coord_flip(
+    clip = "off"
+  ) +
+  ggplot2::labs(
+    title = "Final leave-one-event-out model comparison",
+    subtitle = paste(
+      "Lower RMSE indicates better held-out prediction;",
+      "dotted line shows the mean-only baseline"
+    ),
+    x = NULL,
+    y = "Leave-one-event-out RMSE",
+    fill = "Model family"
+  ) +
+  ggplot2::theme_classic(
+    base_size = 12
+  ) +
+  ggplot2::theme(
+    plot.title = ggplot2::element_text(
+      face = "bold"
+    ),
+    legend.position = "bottom",
+    plot.margin = ggplot2::margin(
+      5.5,
+      35,
+      5.5,
+      5.5
+    )
+  )
+
+MEblack_final_model_comparison_plot
+```
+
+```{r}
+# Save the final model-comparison figure.
+
+ggplot2::ggsave(
+  filename =
+    "MEblack_final_LOEO_model_comparison.png",
+  plot =
+    MEblack_final_model_comparison_plot,
+  width = 9,
+  height = 6,
+  dpi = 300
+)
+```
+
+```{r}
+# Combine the primary statistical results into one concise table
+# for future reporting and presentation use.
+
+MEblack_final_statistical_summary <-
+  tibble::tibble(
+    analysis = c(
+      "MEblack–salinity correlation",
+      "Salinity linear LOEO",
+      "Salinity + location linear LOEO",
+      "Best random forest LOEO"
+    ),
+
+    result = c(
+      paste0(
+        "r = ",
+        round(
+          observed_salinity_correlation,
+          3
+        )
+      ),
+
+      paste0(
+        "RMSE = ",
+        round(
+          observed_salinity_LOEO_RMSE,
+          4
+        )
+      ),
+
+      paste0(
+        "RMSE = ",
+        round(
+          observed_salinity_location_LOEO_RMSE,
+          4
+        )
+      ),
+
+      paste0(
+        "RMSE = ",
+        round(
+          min(
+            MEblack_RF_LOEO_performance$RMSE
+          ),
+          4
+        )
+      )
+    ),
+
+    permutation_p_value = c(
+      exact_salinity_correlation_p,
+      exact_salinity_LOEO_p,
+      exact_salinity_location_LOEO_p,
+      NA_real_
+    ),
+
+    interpretation = c(
+      "Strong negative association",
+      "Strong held-out predictive performance",
+      "Best linear performance; exploratory model",
+      "Detected signal but underperformed linear regression"
+    )
+  )
+
+MEblack_final_statistical_summary
+```
+
+```{r}
+# Save the final statistical summary.
+
+readr::write_csv(
+  MEblack_final_statistical_summary,
+  "MEblack_final_statistical_summary.csv"
+)
+```
+
+```{r}
+# Record the complete R session information so that package
+# versions and the computational environment can be reproduced.
+
+MEblack_session_information <-
+  capture.output(
+    sessionInfo()
+  )
+
+writeLines(
+  MEblack_session_information,
+  con =
+    "MEblack_random_forest_validation_sessionInfo.txt"
+)
+
+sessionInfo()
+```
